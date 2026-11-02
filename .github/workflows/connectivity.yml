@@ -31,12 +31,13 @@ jobs:
           print(json.dumps({'runner_country':country[1],'outside_mainland_china':True}))
           PY
       - name: Join as a temporary Tailscale device
+        id: join
         uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
           version: '1.104.4'
           hostname: crossborder-${{ github.run_id }}
-          args: --accept-dns=false --accept-routes=false
+          args: --accept-dns=false
           timeout: 90s
           retry: 1
           use-cache: 'false'
@@ -64,7 +65,7 @@ jobs:
           PY
           python3 probe.py measure --target "$TARGET_TS_IP" --port 42070 --rounds 3 --delay 10 --ssh-banner --label overseas-to-China
       - name: Allow China-initiated return-path measurements
-        if: always()
+        if: ${{ always() && steps.join.outcome == 'success' }}
         run: |
           echo 'Waiting 150 seconds for the independently initiated return-path probe'
           sleep 150
