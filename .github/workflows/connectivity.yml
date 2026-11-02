@@ -13,6 +13,7 @@ jobs:
     env:
       TARGET_TS_IP: ${{ secrets.TARGET_TS_IP }}
       PROBE_TOKEN: ${{ secrets.PROBE_TOKEN }}
+      SSH_TEST_PUBLIC_KEY: ${{ secrets.SSH_TEST_PUBLIC_KEY }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -70,39 +71,64 @@ jobs:
           print(json.dumps({'enrollment_exit':code,'backend_state':state.get('BackendState'),'online':state.get('Self',{}).get('Online'),'health_count':len(state.get('Health') or []),'invalid_key_reported':'invalid key' in low or 'invalid auth' in low,'approval_mentioned':'approv' in low,'login_url_present':'https://login.tailscale.com/' in text}))
           assert code==0 and state.get('BackendState')=='Running','Enrollment did not complete; see sanitized state above'
           PYAUTH
-      - name: Start synthetic-data return-path listener
+      - name: Start tailnet-only synthetic SSH return-path service
         run: |
-          bind_ip="$(tailscale ip -4)"
-          python3 probe.py serve --bind "$bind_ip" --port 42071 --seconds 600 > "$RUNNER_TEMP/probe-server.log" 2>&1 &
-          echo "$!" > "$RUNNER_TEMP/probe-server.pid"
+          test -n "$SSH_TEST_PUBLIC_KEY"
+          if ! test -x /usr/sbin/sshd; then sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server; fi
+          ssh-keygen -q -t ed25519 -N '' -f "$RUNNER_TEMP/test-host-key"
+          ssh-keygen -q -t ed25519 -N '' -f "$RUNNER_TEMP/self-test-key"
+          printf '%s\n' "$SSH_TEST_PUBLIC_KEY" > "$RUNNER_TEMP/test-authorized-keys"
+          cat "$RUNNER_TEMP/self-test-key.pub" >> "$RUNNER_TEMP/test-authorized-keys"
+          chmod 600 "$RUNNER_TEMP/test-authorized-keys"
+          cat > "$RUNNER_TEMP/test-sshd.conf" <<CFG
+          Port 22
+          ListenAddress $(tailscale ip -4)
+          HostKey $RUNNER_TEMP/test-host-key
+          PidFile $RUNNER_TEMP/test-sshd.pid
+          AuthorizedKeysFile $RUNNER_TEMP/test-authorized-keys
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PubkeyAuthentication yes
+          PermitRootLogin no
+          AllowUsers runner
+          UsePAM yes
+          DisableForwarding yes
+          PermitTTY no
+          PrintMotd no
+          ForceCommand /usr/bin/python3 $GITHUB_WORKSPACE/ssh_payload.py
+          CFG
+          sudo mkdir -p /run/sshd
+          sudo /usr/sbin/sshd -t -f "$RUNNER_TEMP/test-sshd.conf"
+          sudo /usr/sbin/sshd -D -f "$RUNNER_TEMP/test-sshd.conf" > "$RUNNER_TEMP/test-sshd.log" 2>&1 &
           sleep 1
-          kill -0 "$(cat "$RUNNER_TEMP/probe-server.pid")"
-          echo 'Temporary return-path listener ready'
-      - name: Measure overseas-initiated path into China
+          # Prove the listener/account/forced command work before remote measurement.
+          reply="$(ssh -q -i "$RUNNER_TEMP/self-test-key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 "runner@$(tailscale ip -4)" health)"
+          test "$reply" = cross-border-ssh-ok
+          echo 'Ephemeral restricted SSH synthetic service passed local self-check'
+      - name: Verify overseas-initiated SSH path into China
         id: outbound
         continue-on-error: true
         run: |
-          python3 - <<'PY'
-          import os,subprocess,re,json
-          r=subprocess.run(['tailscale','ping','--timeout=5s','--c=4',os.environ['TARGET_TS_IP']],capture_output=True,text=True,timeout=30)
-          rows=[]
-          for line in (r.stdout+r.stderr).splitlines():
-              sample=re.search(r'in ([0-9.]+)ms',line)
-              if sample:rows.append({'path':'DERP' if 'via DERP(' in line else 'peer-relay' if 'peer-relay' in line else 'direct','latency_ms':float(sample[1])})
-          print(json.dumps({'tailscale_ping_exit':r.returncode,'samples':rows}))
-          PY
-          python3 probe.py measure --target "$TARGET_TS_IP" --port 42070 --rounds 3 --delay 10 --ssh-banner --label overseas-to-China
+          python3 - <<'PYSSH'
+          import socket,os,json,time
+          for i in range(3):
+              start=time.monotonic()
+              with socket.create_connection((os.environ['TARGET_TS_IP'],22),timeout=8) as s:
+                  banner=s.recv(256)
+              ok=banner.startswith(b'SSH-')
+              print(json.dumps({'direction':'overseas-to-China','round':i+1,'ssh_banner_passed':ok,'seconds':round(time.monotonic()-start,4)}))
+              assert ok
+              time.sleep(3)
+          PYSSH
       - name: Allow China-initiated return-path measurements
         if: ${{ always() && steps.join.outcome == 'success' }}
         run: |
           echo 'Waiting 150 seconds for the independently initiated return-path probe'
           sleep 150
-      - name: Stop temporary listener
+      - name: Stop temporary SSH listener
         if: always()
         run: |
-          if test -f "$RUNNER_TEMP/probe-server.pid"; then
-            kill "$(cat "$RUNNER_TEMP/probe-server.pid")" 2>/dev/null || true
-          fi
+          if test -f "$RUNNER_TEMP/test-sshd.pid"; then sudo kill "$(cat "$RUNNER_TEMP/test-sshd.pid")" || true; fi
       - name: Remove temporary Tailscale device
         if: always()
         run: sudo /usr/local/bin/tailscale logout || true
