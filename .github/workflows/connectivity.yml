@@ -50,13 +50,22 @@ jobs:
           assert re.fullmatch(r'tskey-auth-[A-Za-z0-9_-]+',key),'Secret must contain a Tailscale Auth key, not an API key'
           code=None;text=''
           try:
-              r=subprocess.run(['sudo','/usr/local/bin/tailscale','up','--auth-key='+key,'--hostname=crossborder-'+os.environ['GITHUB_RUN_ID'],'--accept-dns=false','--accept-routes=false','--timeout=60s'],capture_output=True,text=True,timeout=70)
+              r=subprocess.run(['sudo','/usr/local/bin/tailscale','up','--auth-key='+key,'--hostname=crossborder-'+os.environ['GITHUB_RUN_ID'],'--accept-dns=false','--accept-routes=false','--timeout=15s'],capture_output=True,text=True,timeout=70)
               code=r.returncode;text=r.stdout+r.stderr
           except subprocess.TimeoutExpired:pass
           try:
               q=subprocess.run(['sudo','/usr/local/bin/tailscale','status','--json'],capture_output=True,text=True,timeout=5)
               state=json.loads(q.stdout)
           except Exception:state={}
+          if state.get('BackendState')=='NeedsMachineAuth':
+              print('Temporary device awaits approval in the Tailscale Machines page',flush=True)
+              import time
+              end=time.monotonic()+240
+              while time.monotonic()<end:
+                  time.sleep(3)
+                  q=subprocess.run(['sudo','/usr/local/bin/tailscale','status','--json'],capture_output=True,text=True,timeout=5)
+                  state=json.loads(q.stdout)
+                  if state.get('BackendState')=='Running':code=0;break
           low=text.lower()
           print(json.dumps({'enrollment_exit':code,'backend_state':state.get('BackendState'),'online':state.get('Self',{}).get('Online'),'health_count':len(state.get('Health') or []),'invalid_key_reported':'invalid key' in low or 'invalid auth' in low,'approval_mentioned':'approv' in low,'login_url_present':'https://login.tailscale.com/' in text}))
           assert code==0 and state.get('BackendState')=='Running','Enrollment did not complete; see sanitized state above'
