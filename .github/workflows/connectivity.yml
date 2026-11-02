@@ -77,15 +77,17 @@ jobs:
           if ! test -x /usr/sbin/sshd; then sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server; fi
           ssh-keygen -q -t ed25519 -N '' -f "$RUNNER_TEMP/test-host-key"
           ssh-keygen -q -t ed25519 -N '' -f "$RUNNER_TEMP/self-test-key"
-          printf '%s\n' "$SSH_TEST_PUBLIC_KEY" > "$RUNNER_TEMP/test-authorized-keys"
-          cat "$RUNNER_TEMP/self-test-key.pub" >> "$RUNNER_TEMP/test-authorized-keys"
-          chmod 600 "$RUNNER_TEMP/test-authorized-keys"
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          printf '%s\n' "$SSH_TEST_PUBLIC_KEY" > "$HOME/.ssh/crossborder_authorized_keys"
+          cat "$RUNNER_TEMP/self-test-key.pub" >> "$HOME/.ssh/crossborder_authorized_keys"
+          chmod 600 "$HOME/.ssh/crossborder_authorized_keys"
           cat > "$RUNNER_TEMP/test-sshd.conf" <<CFG
           Port 22
           ListenAddress $(tailscale ip -4)
           HostKey $RUNNER_TEMP/test-host-key
           PidFile $RUNNER_TEMP/test-sshd.pid
-          AuthorizedKeysFile $RUNNER_TEMP/test-authorized-keys
+          AuthorizedKeysFile $HOME/.ssh/crossborder_authorized_keys
           PasswordAuthentication no
           KbdInteractiveAuthentication no
           PubkeyAuthentication yes
@@ -97,12 +99,15 @@ jobs:
           PrintMotd no
           ForceCommand /usr/bin/python3 $GITHUB_WORKSPACE/ssh_payload.py
           CFG
+          sudo systemctl stop ssh.service ssh.socket 2>/dev/null || true
           sudo mkdir -p /run/sshd
           sudo /usr/sbin/sshd -t -f "$RUNNER_TEMP/test-sshd.conf"
           sudo /usr/sbin/sshd -D -f "$RUNNER_TEMP/test-sshd.conf" > "$RUNNER_TEMP/test-sshd.log" 2>&1 &
           sleep 1
           # Prove the listener/account/forced command work before remote measurement.
-          reply="$(ssh -q -i "$RUNNER_TEMP/self-test-key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 "runner@$(tailscale ip -4)" health)"
+          printf '%s ' "$(tailscale ip -4)" > "$RUNNER_TEMP/self-known-hosts"
+          cat "$RUNNER_TEMP/test-host-key.pub" >> "$RUNNER_TEMP/self-known-hosts"
+          reply="$(ssh -q -i "$RUNNER_TEMP/self-test-key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$RUNNER_TEMP/self-known-hosts" -o ConnectTimeout=5 "runner@$(tailscale ip -4)" health)"
           test "$reply" = cross-border-ssh-ok
           echo 'Ephemeral restricted SSH synthetic service passed local self-check'
       - name: Verify overseas-initiated SSH path into China
@@ -123,8 +128,8 @@ jobs:
       - name: Allow China-initiated return-path measurements
         if: ${{ always() && steps.join.outcome == 'success' }}
         run: |
-          echo 'Waiting 150 seconds for the independently initiated return-path probe'
-          sleep 150
+          echo 'Waiting 240 seconds for the independently initiated return-path probe'
+          sleep 240
       - name: Stop temporary SSH listener
         if: always()
         run: |
