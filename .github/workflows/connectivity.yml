@@ -32,16 +32,35 @@ jobs:
           PY
       - name: Join as a temporary Tailscale device
         id: join
-        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c
-        with:
-          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          version: '1.104.4'
-          hostname: crossborder-${{ github.run_id }}
-          args: --accept-dns=false
-          timeout: 90s
-          retry: 1
-          use-cache: 'false'
-          log-mode: quiet
+        env:
+          AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          curl --fail --silent --show-error --max-time 30 https://pkgs.tailscale.com/stable/tailscale_1.104.4_amd64.tgz -o "$RUNNER_TEMP/tailscale.tgz"
+          curl --fail --silent --show-error --max-time 15 https://pkgs.tailscale.com/stable/tailscale_1.104.4_amd64.tgz.sha256 -o "$RUNNER_TEMP/tailscale.sha256"
+          expected="$(awk '{print $1}' "$RUNNER_TEMP/tailscale.sha256")"
+          echo "$expected  $RUNNER_TEMP/tailscale.tgz" | sha256sum --check --status
+          tar -xzf "$RUNNER_TEMP/tailscale.tgz" -C "$RUNNER_TEMP"
+          sudo install -m 755 "$RUNNER_TEMP/tailscale_1.104.4_amd64/tailscale" /usr/local/bin/tailscale
+          sudo install -m 755 "$RUNNER_TEMP/tailscale_1.104.4_amd64/tailscaled" /usr/local/bin/tailscaled
+          sudo /usr/local/bin/tailscaled --state=mem: > "$RUNNER_TEMP/tailscaled.log" 2>&1 &
+          sleep 2
+          python3 - <<'PYAUTH'
+          import os,re,subprocess,json
+          key=os.environ['AUTHKEY']
+          assert re.fullmatch(r'tskey-auth-[A-Za-z0-9_-]+',key),'Secret must contain a Tailscale Auth key, not an API key'
+          code=None;text=''
+          try:
+              r=subprocess.run(['sudo','/usr/local/bin/tailscale','up','--auth-key='+key,'--hostname=crossborder-'+os.environ['GITHUB_RUN_ID'],'--accept-dns=false','--accept-routes=false','--timeout=60s'],capture_output=True,text=True,timeout=70)
+              code=r.returncode;text=r.stdout+r.stderr
+          except subprocess.TimeoutExpired:pass
+          try:
+              q=subprocess.run(['sudo','/usr/local/bin/tailscale','status','--json'],capture_output=True,text=True,timeout=5)
+              state=json.loads(q.stdout)
+          except Exception:state={}
+          low=text.lower()
+          print(json.dumps({'enrollment_exit':code,'backend_state':state.get('BackendState'),'online':state.get('Self',{}).get('Online'),'health_count':len(state.get('Health') or []),'invalid_key_reported':'invalid key' in low or 'invalid auth' in low,'approval_mentioned':'approv' in low,'login_url_present':'https://login.tailscale.com/' in text}))
+          assert code==0 and state.get('BackendState')=='Running','Enrollment did not complete; see sanitized state above'
+          PYAUTH
       - name: Start synthetic-data return-path listener
         run: |
           bind_ip="$(tailscale ip -4)"
@@ -75,6 +94,9 @@ jobs:
           if test -f "$RUNNER_TEMP/probe-server.pid"; then
             kill "$(cat "$RUNNER_TEMP/probe-server.pid")" 2>/dev/null || true
           fi
+      - name: Remove temporary Tailscale device
+        if: always()
+        run: sudo /usr/local/bin/tailscale logout || true
       - name: Report outbound test result
         if: always()
         env:
