@@ -1,0 +1,81 @@
+name: Cross-border Tailscale qualification
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: cross-border-qualification
+  cancel-in-progress: false
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TARGET_TS_IP: ${{ secrets.TARGET_TS_IP }}
+      PROBE_TOKEN: ${{ secrets.PROBE_TOKEN }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Verify overseas runner and required inputs
+        env:
+          AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          test -n "$AUTHKEY" && test -n "$TARGET_TS_IP" && test -n "$PROBE_TOKEN"
+          python3 - <<'PY'
+          import urllib.request,json,re
+          with urllib.request.urlopen('https://www.cloudflare.com/cdn-cgi/trace',timeout=15) as r:
+              text=r.read(8192).decode()
+          country=re.search(r'^loc=([A-Z]{2})$',text,re.M)
+          assert country and country[1]!='CN','Runner country not verified outside mainland China'
+          print(json.dumps({'runner_country':country[1],'outside_mainland_china':True}))
+          PY
+      - name: Join as a temporary Tailscale device
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          version: '1.104.4'
+          hostname: crossborder-${{ github.run_id }}
+          args: --accept-dns=false --accept-routes=false
+          timeout: 90s
+          retry: 1
+          use-cache: 'false'
+          log-mode: quiet
+      - name: Start synthetic-data return-path listener
+        run: |
+          bind_ip="$(tailscale ip -4)"
+          python3 probe.py serve --bind "$bind_ip" --port 42071 --seconds 600 > "$RUNNER_TEMP/probe-server.log" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/probe-server.pid"
+          sleep 1
+          kill -0 "$(cat "$RUNNER_TEMP/probe-server.pid")"
+          echo 'Temporary return-path listener ready'
+      - name: Measure overseas-initiated path into China
+        id: outbound
+        continue-on-error: true
+        run: |
+          python3 - <<'PY'
+          import os,subprocess,re,json
+          r=subprocess.run(['tailscale','ping','--timeout=5s','--c=4',os.environ['TARGET_TS_IP']],capture_output=True,text=True,timeout=30)
+          rows=[]
+          for line in (r.stdout+r.stderr).splitlines():
+              sample=re.search(r'in ([0-9.]+)ms',line)
+              if sample:rows.append({'path':'DERP' if 'via DERP(' in line else 'peer-relay' if 'peer-relay' in line else 'direct','latency_ms':float(sample[1])})
+          print(json.dumps({'tailscale_ping_exit':r.returncode,'samples':rows}))
+          PY
+          python3 probe.py measure --target "$TARGET_TS_IP" --port 42070 --rounds 3 --delay 10 --ssh-banner --label overseas-to-China
+      - name: Allow China-initiated return-path measurements
+        if: always()
+        run: |
+          echo 'Waiting 150 seconds for the independently initiated return-path probe'
+          sleep 150
+      - name: Stop temporary listener
+        if: always()
+        run: |
+          if test -f "$RUNNER_TEMP/probe-server.pid"; then
+            kill "$(cat "$RUNNER_TEMP/probe-server.pid")" 2>/dev/null || true
+          fi
+      - name: Report outbound test result
+        if: always()
+        env:
+          OUTCOME: ${{ steps.outbound.outcome }}
+        run: test "$OUTCOME" = success
